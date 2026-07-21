@@ -17,13 +17,14 @@ namespace RateLimiting.Core;
 /// <para>
 /// Trade-off: the estimate assumes requests were evenly spread across the
 /// previous window, so it can be slightly strict or lenient near boundaries.
-/// Cloudflare measured ~0.003% of requests mis-decided at scale — an excellent
-/// price for constant memory. See DESIGN.md for the comparison.
+/// Cloudflare measured ~0.003% of requests mis-decided on one large production
+/// workload; accuracy remains traffic-dependent. See DESIGN.md for context.
 /// </para>
 /// </remarks>
 public sealed class SlidingWindowRateLimiter : IRateLimiter
 {
     private const int DefaultMaxTrackedKeys = 100_000;
+    private const long MaxExactCount = (1L << 53) - 1;
 
     private readonly TimeProvider _time;
     private readonly long _limit;
@@ -31,6 +32,11 @@ public sealed class SlidingWindowRateLimiter : IRateLimiter
     private readonly TimeSpan _window;
     private readonly KeyedStateStore<WindowState> _states;
 
+    /// <summary>Initializes a weighted sliding-window limiter.</summary>
+    /// <param name="limit">Maximum admitted requests per rolling window.</param>
+    /// <param name="window">Duration of the rolling window.</param>
+    /// <param name="timeProvider">Optional clock used for deterministic testing.</param>
+    /// <param name="maxTrackedKeys">Hard upper bound on retained per-key states.</param>
     public SlidingWindowRateLimiter(
         long limit,
         TimeSpan window,
@@ -38,44 +44,57 @@ public sealed class SlidingWindowRateLimiter : IRateLimiter
         int maxTrackedKeys = DefaultMaxTrackedKeys)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, MaxExactCount);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(window, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(
+            window,
+            TimeSpan.FromTicks(TimeSpan.MaxValue.Ticks / 2));
         ArgumentOutOfRangeException.ThrowIfLessThan(maxTrackedKeys, 1);
 
         _time = timeProvider ?? TimeProvider.System;
         _limit = limit;
         _window = window;
-        _windowTicks = (long)(window.TotalSeconds * _time.TimestampFrequency);
+
+        var timestampTicks = window.TotalSeconds * _time.TimestampFrequency;
+        if (!double.IsFinite(timestampTicks) || timestampTicks < 1 || timestampTicks >= long.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(window), "Window is outside the time provider's supported range.");
+
+        _windowTicks = (long)Math.Ceiling(timestampTicks);
 
         // After two idle windows both counters are zero, which is exactly the
         // state of a fresh entry — so eviction never changes behavior.
         _states = new KeyedStateStore<WindowState>(_time, maxTrackedKeys, window * 2);
     }
 
+    /// <inheritdoc />
     public RateLimitDecision TryAcquire(string key)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
 
-        var now = _time.GetTimestamp();
-        var state = _states.GetOrAdd(key, () => new WindowState(now));
-
-        lock (state)
+        return _states.Use(
+            key,
+            () => new WindowState(_time.GetTimestamp()),
+            state =>
         {
+            var now = _time.GetTimestamp();
             AdvanceWindows(state, now);
 
             var elapsedFraction = (double)(now - state.WindowStart) / _windowTicks;
             var overlap = 1.0 - elapsedFraction;
             var weighted = state.PreviousCount * overlap + state.CurrentCount;
+            var weightedAfterRequest = weighted + 1;
 
-            if (weighted < _limit)
+            if (weightedAfterRequest <= _limit)
             {
                 state.CurrentCount++;
                 state.Touch(now);
-                return RateLimitDecision.Allowed(Math.Max(0, (long)(_limit - weighted - 1)));
+                var remaining = (long)Math.Floor(_limit - weightedAfterRequest);
+                return RateLimitDecision.Allowed(Math.Max(0, remaining));
             }
 
             state.Touch(now);
             return RateLimitDecision.Rejected(ComputeRetryAfter(state, elapsedFraction));
-        }
+        });
     }
 
     /// <summary>Rolls the fixed windows forward if <paramref name="now"/> is beyond the current one.</summary>
@@ -94,36 +113,49 @@ public sealed class SlidingWindowRateLimiter : IRateLimiter
         state.WindowStart += windowsPassed * _windowTicks;
     }
 
+    /// <summary>Computes a rounded-up delay that makes the next request admissible.</summary>
     private TimeSpan ComputeRetryAfter(WindowState state, double elapsedFraction)
     {
-        var timeLeftInWindow = TimeSpan.FromSeconds(
-            (1.0 - elapsedFraction) * _window.TotalSeconds);
+        double waitInWindows;
 
-        // The current window alone is at the limit: decay of the previous
-        // window cannot help, the client must wait for the next rollover.
-        if (state.CurrentCount >= _limit || state.PreviousCount == 0)
-            return timeLeftInWindow;
+        if (state.CurrentCount < _limit && state.PreviousCount > 0)
+        {
+            // Solve prev * (1 - f) + cur + 1 <= limit for f. The +1 is the
+            // retrying request itself; omitting it would over-admit by one.
+            var allowedPreviousWeight = _limit - state.CurrentCount - 1;
+            var admittingFraction = 1.0 - (double)allowedPreviousWeight / state.PreviousCount;
+            waitInWindows = Math.Max(0, admittingFraction - elapsedFraction);
+        }
+        else
+        {
+            // The current counter is full. At rollover it becomes the previous
+            // counter, so merely waiting for rollover is not enough: it must
+            // also decay far enough to make room for the retrying request.
+            var untilRollover = 1.0 - elapsedFraction;
+            var fractionAfterRollover = state.CurrentCount == 0
+                ? 0
+                : 1.0 - (double)(_limit - 1) / state.CurrentCount;
+            waitInWindows = untilRollover + Math.Clamp(fractionAfterRollover, 0, 1);
+        }
 
-        // Otherwise the weighted count decays linearly as the previous window
-        // slides out. Solve  prev * (1 - f) + cur < limit  for the window
-        // fraction f, then convert the difference into wall-clock time.
-        var admittingFraction = 1.0 - (double)(_limit - state.CurrentCount) / state.PreviousCount;
-        var wait = TimeSpan.FromSeconds(
-            (admittingFraction - elapsedFraction) * _window.TotalSeconds);
-
-        if (wait <= TimeSpan.Zero)
-            wait = TimeSpan.FromMilliseconds(1); // boundary case: retry immediately after
-
-        return wait < timeLeftInWindow ? wait : timeLeftInWindow;
+        // Round upward to a TimeSpan tick so advancing by the advertised value
+        // can never land infinitesimally before the admission boundary.
+        var waitTicks = decimal.Ceiling((decimal)waitInWindows * _window.Ticks);
+        return TimeSpan.FromTicks(Math.Max(1, (long)waitTicks));
     }
 
+    /// <summary>Stores the two counters and timestamps required for one client's rolling estimate.</summary>
+    /// <param name="windowStart">Monotonic timestamp at which the current fixed window began.</param>
     private sealed class WindowState(long windowStart) : KeyedStateStore<WindowState>.IExpirable
     {
+        private long _lastTouched = windowStart;
+
         public long WindowStart = windowStart;
         public long PreviousCount;
         public long CurrentCount;
-        public long LastTouched { get; private set; } = windowStart;
+        public long LastTouched => Volatile.Read(ref _lastTouched);
 
-        public void Touch(long now) => LastTouched = now;
+        /// <summary>Records the timestamp of the window state's most recent access.</summary>
+        public void Touch(long now) => Volatile.Write(ref _lastTouched, now);
     }
 }

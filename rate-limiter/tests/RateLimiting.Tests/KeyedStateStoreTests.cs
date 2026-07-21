@@ -5,17 +5,20 @@ using Xunit;
 namespace RateLimiting.Tests;
 
 /// <summary>
-/// The memory-bound invariant lives in the (internal) KeyedStateStore, and is
-/// deliberately invisible from the public API — eviction is lossless — so it is
-/// tested directly here via InternalsVisibleTo.
+/// The memory-bound invariant lives in the internal KeyedStateStore, so strict
+/// capacity, lossless idle eviction, and fail-open overflow are tested directly
+/// through InternalsVisibleTo.
 /// </summary>
 public class KeyedStateStoreTests
 {
+    /// <summary>Minimal expirable state used to exercise the bounded store.</summary>
+    /// <param name="touched">Monotonic last-access timestamp.</param>
     private sealed class FakeState(long touched) : KeyedStateStore<FakeState>.IExpirable
     {
         public long LastTouched { get; } = touched;
     }
 
+    /// <summary>Verifies that expired entries are evicted before a fresh key is retained.</summary>
     [Fact]
     public void Evicts_idle_entries_once_the_key_cap_is_exceeded()
     {
@@ -23,40 +26,81 @@ public class KeyedStateStoreTests
         var store = new KeyedStateStore<FakeState>(time, maxTrackedKeys: 10, idleTimeout: TimeSpan.FromMinutes(1));
 
         for (var i = 0; i < 10; i++)
-            store.GetOrAdd($"stale-{i}", () => new FakeState(time.GetTimestamp()));
+            store.Use($"stale-{i}", () => new FakeState(time.GetTimestamp()), state => state);
 
         time.Advance(TimeSpan.FromMinutes(2)); // everything above is now idle
 
-        store.GetOrAdd("fresh", () => new FakeState(time.GetTimestamp()));
+        store.Use("fresh", () => new FakeState(time.GetTimestamp()), state => state);
 
         Assert.Equal(1, store.Count); // the 10 idle entries were swept, "fresh" survives
     }
 
+    /// <summary>Verifies fail-open transient state when all retained entries remain active.</summary>
     [Fact]
-    public void Never_evicts_entries_that_are_still_active()
+    public void At_capacity_keeps_active_entries_and_returns_transient_state_for_new_keys()
     {
         var time = new FakeTimeProvider();
         var store = new KeyedStateStore<FakeState>(time, maxTrackedKeys: 10, idleTimeout: TimeSpan.FromMinutes(1));
 
         for (var i = 0; i < 10; i++)
-            store.GetOrAdd($"active-{i}", () => new FakeState(time.GetTimestamp()));
+            store.Use($"active-{i}", () => new FakeState(time.GetTimestamp()), state => state);
 
         time.Advance(TimeSpan.FromSeconds(30)); // below the idle timeout
 
-        store.GetOrAdd("one-more", () => new FakeState(time.GetTimestamp()));
+        var firstTransient = store.Use(
+            "one-more",
+            () => new FakeState(time.GetTimestamp()),
+            state => state);
+        var secondTransient = store.Use(
+            "one-more",
+            () => new FakeState(time.GetTimestamp()),
+            state => state);
 
-        Assert.Equal(11, store.Count); // sweep ran but found nothing idle
+        Assert.Equal(10, store.Count);
+        Assert.NotSame(firstTransient, secondTransient);
     }
 
+    /// <summary>Verifies that concurrent key rotation never exceeds the hard capacity.</summary>
+    [Fact]
+    public void Never_exceeds_the_key_cap_under_parallel_rotation()
+    {
+        var time = new FakeTimeProvider();
+        var store = new KeyedStateStore<FakeState>(time, maxTrackedKeys: 10, idleTimeout: TimeSpan.FromMinutes(1));
+
+        Parallel.For(0, 1_000, i =>
+            store.Use(
+                $"rotating-{i}",
+                () => new FakeState(time.GetTimestamp()),
+                state => state));
+
+        Assert.Equal(10, store.Count);
+    }
+
+    /// <summary>Verifies that repeated access to a retained key returns the same instance.</summary>
     [Fact]
     public void Returns_the_same_state_instance_for_the_same_key()
     {
         var time = new FakeTimeProvider();
         var store = new KeyedStateStore<FakeState>(time, maxTrackedKeys: 100, idleTimeout: TimeSpan.FromMinutes(1));
 
-        var first = store.GetOrAdd("k", () => new FakeState(time.GetTimestamp()));
-        var second = store.GetOrAdd("k", () => new FakeState(time.GetTimestamp()));
+        var first = store.Use("k", () => new FakeState(time.GetTimestamp()), state => state);
+        var second = store.Use("k", () => new FakeState(time.GetTimestamp()), state => state);
 
         Assert.Same(first, second);
+    }
+
+    /// <summary>Verifies that invalid capacity and idle-timeout values fail during construction.</summary>
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(-1, 1)]
+    [InlineData(1, 0)]
+    [InlineData(1, -1)]
+    public void Invalid_configuration_is_rejected(int maxTrackedKeys, int idleSeconds)
+    {
+        Assert.ThrowsAny<ArgumentOutOfRangeException>(() =>
+            new KeyedStateStore<FakeState>(
+                new FakeTimeProvider(),
+                maxTrackedKeys,
+                TimeSpan.FromSeconds(idleSeconds)));
     }
 }

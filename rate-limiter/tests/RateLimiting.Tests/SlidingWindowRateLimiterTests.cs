@@ -4,11 +4,13 @@ using Xunit;
 
 namespace RateLimiting.Tests;
 
+/// <summary>Verifies weighted sliding-window admission, decay, retry, and validation behavior.</summary>
 public class SlidingWindowRateLimiterTests
 {
     private const string Key = "client-1";
     private static readonly TimeSpan Window = TimeSpan.FromSeconds(60);
 
+    /// <summary>Verifies that exactly the configured rolling-window limit is admitted.</summary>
     [Fact]
     public void Allows_up_to_limit_within_a_window_then_rejects()
     {
@@ -20,24 +22,32 @@ public class SlidingWindowRateLimiterTests
         Assert.False(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that adjacent fixed-window bursts cannot double the rolling budget.</summary>
     [Fact]
     public void Prevents_the_classic_fixed_window_boundary_burst()
     {
-        // With a fixed 60s window, 10 requests at t=59 plus 10 at t=61 would all
-        // pass (20 requests in 2 seconds). The sliding window must not allow that.
         var time = new FakeTimeProvider();
         var limiter = new SlidingWindowRateLimiter(limit: 10, Window, time);
 
-        for (var i = 0; i < 10; i++)
+        // Establish the first window, then fill it immediately before rollover.
+        Assert.True(limiter.TryAcquire(Key).IsAllowed);
+        time.Advance(TimeSpan.FromSeconds(59));
+        for (var i = 0; i < 9; i++)
             Assert.True(limiter.TryAcquire(Key).IsAllowed);
 
-        time.Advance(TimeSpan.FromSeconds(61));
+        time.Advance(TimeSpan.FromSeconds(2));
 
-        // Weighted count: 10 * (59/60) ≈ 9.83 → exactly one slot has decayed free.
+        // A fixed counter would reset and admit another burst. The sliding
+        // estimate is 9.83; including this request would exceed the limit.
+        var rejected = limiter.TryAcquire(Key);
+        Assert.False(rejected.IsAllowed);
+
+        time.Advance(rejected.RetryAfter);
         Assert.True(limiter.TryAcquire(Key).IsAllowed);
         Assert.False(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies linear decay of the previous window's weighted contribution.</summary>
     [Fact]
     public void Previous_window_weight_decays_linearly()
     {
@@ -48,16 +58,17 @@ public class SlidingWindowRateLimiterTests
             limiter.TryAcquire(Key);
 
         // 90s later we are halfway through the next window: the 5 old requests
-        // weigh 5 * 0.5 = 2.5, so exactly 8 more fit under the limit of 10.
+        // weigh 5 * 0.5 = 2.5, so seven whole requests fit under the limit.
         time.Advance(TimeSpan.FromSeconds(90));
 
         var allowed = 0;
         while (limiter.TryAcquire(Key).IsAllowed)
             allowed++;
 
-        Assert.Equal(8, allowed);
+        Assert.Equal(7, allowed);
     }
 
+    /// <summary>Verifies that state becomes equivalent to fresh after two idle windows.</summary>
     [Fact]
     public void State_fully_expires_after_two_idle_windows()
     {
@@ -73,6 +84,7 @@ public class SlidingWindowRateLimiterTests
             Assert.True(limiter.TryAcquire(Key).IsAllowed, $"request {i + 1} should pass");
     }
 
+    /// <summary>Verifies that waiting the advertised delay makes the retry admissible.</summary>
     [Fact]
     public void Waiting_the_reported_retry_after_makes_the_retry_succeed()
     {
@@ -83,18 +95,15 @@ public class SlidingWindowRateLimiterTests
             limiter.TryAcquire(Key);
 
         time.Advance(TimeSpan.FromSeconds(61));
-        limiter.TryAcquire(Key); // consumes the one decayed slot
-
         var rejected = limiter.TryAcquire(Key);
         Assert.False(rejected.IsAllowed);
-        Assert.True(rejected.RetryAfter > TimeSpan.Zero);
+        Assert.Equal(5, rejected.RetryAfter.TotalSeconds, precision: 3);
 
-        // RetryAfter is the exact decay boundary; one millisecond past it the
-        // weighted count is strictly under the limit again.
-        time.Advance(rejected.RetryAfter + TimeSpan.FromMilliseconds(1));
+        time.Advance(rejected.RetryAfter);
         Assert.True(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that a full current window waits through rollover and weighted decay.</summary>
     [Fact]
     public void Rejection_when_current_window_is_full_waits_for_rollover()
     {
@@ -108,10 +117,15 @@ public class SlidingWindowRateLimiterTests
         var rejected = limiter.TryAcquire(Key);
 
         Assert.False(rejected.IsAllowed);
-        // Window started at first request (t=15s); it rolls over 60s later.
-        Assert.Equal(60, rejected.RetryAfter.TotalSeconds, precision: 3);
+        // At rollover the full current counter becomes the previous counter;
+        // it then needs 1/5 of a window to decay one complete request slot.
+        Assert.Equal(72, rejected.RetryAfter.TotalSeconds, precision: 3);
+
+        time.Advance(rejected.RetryAfter);
+        Assert.True(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that distinct keys receive independent window budgets.</summary>
     [Fact]
     public void Keys_have_independent_budgets()
     {
@@ -124,14 +138,27 @@ public class SlidingWindowRateLimiterTests
         Assert.True(limiter.TryAcquire("client-b").IsAllowed);
     }
 
+    /// <summary>Verifies that invalid limits and durations fail during construction.</summary>
     [Theory]
     [InlineData(0, 60)]    // limit below 1
     [InlineData(-5, 60)]
+    [InlineData(long.MaxValue, 60)] // count must remain exactly representable in weighted math
     [InlineData(10, 0)]    // window must be positive
     [InlineData(10, -30)]
     public void Invalid_configuration_is_rejected_up_front(long limit, int windowSeconds)
     {
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new SlidingWindowRateLimiter(limit, TimeSpan.FromSeconds(windowSeconds)));
+    }
+
+    /// <summary>Verifies that null, empty, and whitespace client keys are rejected.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Invalid_key_is_rejected(string? key)
+    {
+        var limiter = new SlidingWindowRateLimiter(limit: 1, Window);
+        Assert.ThrowsAny<ArgumentException>(() => limiter.TryAcquire(key!));
     }
 }

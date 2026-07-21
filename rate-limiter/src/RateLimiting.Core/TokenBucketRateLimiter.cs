@@ -26,6 +26,11 @@ public sealed class TokenBucketRateLimiter : IRateLimiter
     private readonly double _tokensPerSecond;
     private readonly KeyedStateStore<Bucket> _buckets;
 
+    /// <summary>Initializes a token bucket limiter with the requested burst and refill limits.</summary>
+    /// <param name="capacity">Maximum burst size for each key.</param>
+    /// <param name="tokensPerSecond">Continuous refill rate for each key.</param>
+    /// <param name="timeProvider">Optional clock used for deterministic testing.</param>
+    /// <param name="maxTrackedKeys">Hard upper bound on retained per-key states.</param>
     public TokenBucketRateLimiter(
         int capacity,
         double tokensPerSecond,
@@ -33,7 +38,8 @@ public sealed class TokenBucketRateLimiter : IRateLimiter
         int maxTrackedKeys = DefaultMaxTrackedKeys)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tokensPerSecond);
+        if (!double.IsFinite(tokensPerSecond) || tokensPerSecond <= 0)
+            throw new ArgumentOutOfRangeException(nameof(tokensPerSecond), "Rate must be finite and positive.");
         ArgumentOutOfRangeException.ThrowIfLessThan(maxTrackedKeys, 1);
 
         _time = timeProvider ?? TimeProvider.System;
@@ -42,21 +48,30 @@ public sealed class TokenBucketRateLimiter : IRateLimiter
 
         // A bucket untouched for capacity/rate seconds is full again, and a full
         // bucket is indistinguishable from a brand-new one — so evicting it is free.
-        var timeToFull = TimeSpan.FromSeconds(capacity / tokensPerSecond);
+        var timeToFullSeconds = capacity / tokensPerSecond;
+        if (timeToFullSeconds >= TimeSpan.MaxValue.TotalSeconds)
+            throw new ArgumentOutOfRangeException(nameof(tokensPerSecond), "Rate is too small to represent the refill interval.");
+
+        var timeToFull = TimeSpan.FromSeconds(timeToFullSeconds);
+        if (timeToFull < TimeSpan.FromTicks(1))
+            timeToFull = TimeSpan.FromTicks(1);
+
         _buckets = new KeyedStateStore<Bucket>(_time, maxTrackedKeys, timeToFull);
     }
 
+    /// <inheritdoc />
     public RateLimitDecision TryAcquire(string key)
     {
-        ArgumentNullException.ThrowIfNull(key);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
 
-        var bucket = _buckets.GetOrAdd(key, () => new Bucket(_capacity, _time.GetTimestamp()));
-
-        // Per-bucket lock: contention exists only between concurrent requests of
-        // the *same* client, which is exactly the case we must serialize anyway.
-        lock (bucket)
+        return _buckets.Use(
+            key,
+            () => new Bucket(_capacity, _time.GetTimestamp()),
+            bucket =>
         {
-            Refill(bucket);
+            var now = _time.GetTimestamp();
+            Refill(bucket, now);
+            bucket.Touch(now);
 
             if (bucket.Tokens >= 1.0)
             {
@@ -65,13 +80,15 @@ public sealed class TokenBucketRateLimiter : IRateLimiter
             }
 
             var missingTokens = 1.0 - bucket.Tokens;
-            return RateLimitDecision.Rejected(TimeSpan.FromSeconds(missingTokens / _tokensPerSecond));
-        }
+            var retryAfter = TimeSpan.FromSeconds(missingTokens / _tokensPerSecond);
+            return RateLimitDecision.Rejected(
+                retryAfter < TimeSpan.FromTicks(1) ? TimeSpan.FromTicks(1) : retryAfter);
+        });
     }
 
-    private void Refill(Bucket bucket)
+    /// <summary>Credits tokens accumulated since the bucket's previous observation.</summary>
+    private void Refill(Bucket bucket, long now)
     {
-        var now = _time.GetTimestamp();
         var elapsed = _time.GetElapsedTime(bucket.LastRefill, now);
         if (elapsed <= TimeSpan.Zero)
             return;
@@ -80,11 +97,19 @@ public sealed class TokenBucketRateLimiter : IRateLimiter
         bucket.LastRefill = now;
     }
 
+    /// <summary>Stores the mutable token balance and timestamps for one client.</summary>
+    /// <param name="tokens">Initial token balance.</param>
+    /// <param name="timestamp">Monotonic creation timestamp.</param>
     private sealed class Bucket(double tokens, long timestamp) : KeyedStateStore<Bucket>.IExpirable
     {
+        private long _lastTouched = timestamp;
+
         public double Tokens = tokens;
         public long LastRefill = timestamp;
 
-        public long LastTouched => LastRefill;
+        public long LastTouched => Volatile.Read(ref _lastTouched);
+
+        /// <summary>Records the timestamp of the bucket's most recent access.</summary>
+        public void Touch(long now) => Volatile.Write(ref _lastTouched, now);
     }
 }

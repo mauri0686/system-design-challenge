@@ -12,6 +12,7 @@ namespace RateLimiting.Tests;
 /// </summary>
 public class ConcurrencyTests
 {
+    /// <summary>Verifies token-bucket capacity under simultaneous requests for one key.</summary>
     [Fact]
     public void TokenBucket_never_admits_more_than_capacity_under_parallel_load()
     {
@@ -28,6 +29,7 @@ public class ConcurrencyTests
         Assert.Equal(capacity, allowed);
     }
 
+    /// <summary>Verifies sliding-window capacity under simultaneous requests for one key.</summary>
     [Fact]
     public void SlidingWindow_never_admits_more_than_limit_under_parallel_load()
     {
@@ -44,6 +46,7 @@ public class ConcurrencyTests
         Assert.Equal(limit, allowed);
     }
 
+    /// <summary>Verifies full independent budgets during concurrent traffic across many keys.</summary>
     [Fact]
     public void Parallel_traffic_on_distinct_keys_gets_full_independent_budgets()
     {

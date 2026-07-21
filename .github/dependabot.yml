@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: nuget
+    directory: /rate-limiter
+    schedule:
+      interval: weekly
+    groups:
+      nuget:
+        patterns:
+          - "*"

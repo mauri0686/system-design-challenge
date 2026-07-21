@@ -4,10 +4,12 @@ using Xunit;
 
 namespace RateLimiting.Tests;
 
+/// <summary>Verifies token-bucket admission, refill, isolation, and validation behavior.</summary>
 public class TokenBucketRateLimiterTests
 {
     private const string Key = "client-1";
 
+    /// <summary>Verifies that the configured burst is admitted and the next request is rejected.</summary>
     [Fact]
     public void Allows_burst_up_to_capacity_then_rejects()
     {
@@ -19,6 +21,7 @@ public class TokenBucketRateLimiterTests
         Assert.False(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that successful requests report a monotonically decreasing budget.</summary>
     [Fact]
     public void Remaining_counts_down_with_each_request()
     {
@@ -29,6 +32,7 @@ public class TokenBucketRateLimiterTests
         Assert.Equal(0, limiter.TryAcquire(Key).Remaining);
     }
 
+    /// <summary>Verifies that rejection reports the exact delay required to refill one token.</summary>
     [Fact]
     public void Rejection_reports_exact_time_until_next_token()
     {
@@ -43,6 +47,7 @@ public class TokenBucketRateLimiterTests
         Assert.Equal(0.5, decision.RetryAfter.TotalSeconds, precision: 3);
     }
 
+    /// <summary>Verifies continuous fractional refill as monotonic time advances.</summary>
     [Fact]
     public void Refills_continuously_while_time_passes()
     {
@@ -62,6 +67,7 @@ public class TokenBucketRateLimiterTests
         Assert.Equal(0.5, rejected.RetryAfter.TotalSeconds, precision: 3);
     }
 
+    /// <summary>Verifies that waiting the advertised delay makes the next request admissible.</summary>
     [Fact]
     public void Waiting_the_reported_retry_after_makes_the_retry_succeed()
     {
@@ -78,6 +84,22 @@ public class TokenBucketRateLimiterTests
         Assert.True(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that sub-tick refill rates still produce a positive actionable delay.</summary>
+    [Fact]
+    public void Extremely_fast_refill_reports_a_representable_retry_delay()
+    {
+        var time = new FakeTimeProvider();
+        var limiter = new TokenBucketRateLimiter(capacity: 1, tokensPerSecond: double.MaxValue, time);
+
+        Assert.True(limiter.TryAcquire(Key).IsAllowed);
+        var rejected = limiter.TryAcquire(Key);
+
+        Assert.Equal(TimeSpan.FromTicks(1), rejected.RetryAfter);
+        time.Advance(rejected.RetryAfter);
+        Assert.True(limiter.TryAcquire(Key).IsAllowed);
+    }
+
+    /// <summary>Verifies that idle refill never exceeds the configured burst capacity.</summary>
     [Fact]
     public void Long_idle_does_not_accumulate_more_than_capacity()
     {
@@ -92,6 +114,7 @@ public class TokenBucketRateLimiterTests
         Assert.False(limiter.TryAcquire(Key).IsAllowed);
     }
 
+    /// <summary>Verifies that distinct keys receive independent token budgets.</summary>
     [Fact]
     public void Keys_have_independent_budgets()
     {
@@ -104,21 +127,36 @@ public class TokenBucketRateLimiterTests
         Assert.True(limiter.TryAcquire("client-b").IsAllowed);
     }
 
+    /// <summary>Verifies that invalid capacities and refill rates fail during construction.</summary>
     [Theory]
     [InlineData(0, 1.0)]   // capacity below 1
     [InlineData(-3, 1.0)]
     [InlineData(5, 0.0)]   // rate must be positive
     [InlineData(5, -2.5)]
+    [InlineData(5, double.NaN)]
+    [InlineData(5, double.PositiveInfinity)]
+    [InlineData(5, double.Epsilon)]
     public void Invalid_configuration_is_rejected_up_front(int capacity, double tokensPerSecond)
     {
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new TokenBucketRateLimiter(capacity, tokensPerSecond));
     }
 
+    /// <summary>Verifies that a null client key is rejected.</summary>
     [Fact]
     public void Null_key_is_rejected()
     {
         var limiter = new TokenBucketRateLimiter(capacity: 1, tokensPerSecond: 1);
         Assert.Throws<ArgumentNullException>(() => limiter.TryAcquire(null!));
+    }
+
+    /// <summary>Verifies that empty and whitespace client keys are rejected.</summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Empty_key_is_rejected(string key)
+    {
+        var limiter = new TokenBucketRateLimiter(capacity: 1, tokensPerSecond: 1);
+        Assert.Throws<ArgumentException>(() => limiter.TryAcquire(key));
     }
 }
